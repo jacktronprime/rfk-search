@@ -49,20 +49,16 @@ def scrape_pdf_urls():
         
         pdf_urls = []
         for link in links:
-            # Check if the link has an href attribute
             href = link.get("href")
             if not href:
                 logger.debug("Link without href attribute encountered")
                 continue
             
-            # Normalize href
             href = href.strip()
             if not href:
                 continue
                 
-            # Check if it's a PDF and related to RFK
             if href.endswith(".pdf") and "rfk" in href.lower():
-                # Ensure absolute URL
                 if href.startswith("https://"):
                     pdf_urls.append(href)
                 else:
@@ -76,45 +72,21 @@ def scrape_pdf_urls():
         logger.error(f"Error scraping PDF URLs: {e}")
         return []
 
-# Load or scrape PDF URLs, but skip if indexes exist
-if os.path.exists(KEYWORD_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
-    logger.info("Indexes found, skipping scraping and indexing.")
+# Scrape URLs
+PDF_URLS = scrape_pdf_urls()
+
+# Fallback: If scraping fails, use a few known URLs from the website content
+if not PDF_URLS:
+    logger.warning("Scraping failed. Using fallback URLs.")
     PDF_URLS = [
         "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
         "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
         "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-    ]  # Use fallback URLs for reference
-    documents_df = pd.read_csv("documents_metadata.csv") if os.path.exists("documents_metadata.csv") else pd.DataFrame()
-else:
-    PDF_URLS = scrape_pdf_urls()
-    if not PDF_URLS:
-        logger.warning("Scraping failed. Using fallback URLs.")
-        PDF_URLS = [
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-        ]
-    # Process PDFs in batches to manage memory
-    BATCH_SIZE = 5
-    documents_df = pd.DataFrame()
-    if PDF_URLS:
-        for i in range(0, len(PDF_URLS), BATCH_SIZE):
-            batch_urls = PDF_URLS[i:i + BATCH_SIZE]
-            logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
-            batch_df = process_urls(batch_urls)
-            documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
-    else:
-        logger.warning("No PDF URLs found to process.")
-    if not documents_df.empty:
-        create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
-        create_semantic_index(documents_df)
-    else:
-        logger.warning("Skipping index creation due to empty document set.")
+    ]
 
 # --- Step 2: Stream and Extract Text from PDFs ---
 def stream_and_extract_text(url):
     try:
-        # Setup session with retries
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=1)
         session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -123,18 +95,15 @@ def stream_and_extract_text(url):
             logger.error(f"Failed to fetch {url}: Status {response.status_code}")
             return None, []
         
-        # Process PDF in memory
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             text_chunks = []
             page_count = len(pdf.pages)
             for i, page in enumerate(pdf.pages):
-                # Try standard text extraction
                 text = page.extract_text() or ""
                 if text.strip():
                     text_chunks.append({"page": i + 1, "text": text})
                     logger.info(f"Page {i+1} (text): {text[:50]}...")
                 elif PYTESSERACT_AVAILABLE:
-                    # Fallback to OCR
                     try:
                         image = page.to_image(resolution=300).original
                         text = pytesseract.image_to_string(image, lang='eng')
@@ -158,11 +127,11 @@ def stream_and_extract_text(url):
         logger.error(f"Error processing {url}: {e}")
         return None, []
 
+# --- Ensure process_urls is defined before it's called ---
 def process_urls(urls):
     documents = []
     for url in urls:
         try:
-            # Validate URL
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=1)
             session.mount("https://", HTTPAdapter(max_retries=retries))
@@ -189,6 +158,18 @@ def process_urls(urls):
     df.to_csv("documents_metadata.csv", index=False)
     logger.info(f"Processed {len(df)} document chunks from {len(urls)} PDFs")
     return df
+
+# Process PDFs in batches to manage memory
+BATCH_SIZE = 5
+documents_df = pd.DataFrame()
+if PDF_URLS:
+    for i in range(0, len(PDF_URLS), BATCH_SIZE):
+        batch_urls = PDF_URLS[i:i + BATCH_SIZE]
+        logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
+        batch_df = process_urls(batch_urls)  # Now process_urls is defined
+        documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
+else:
+    logger.warning("No PDF URLs found to process.")
 
 # --- Step 3: Create Keyword Index with Whoosh ---
 def create_keyword_index(documents_df, index_dir):
@@ -217,6 +198,15 @@ def create_keyword_index(documents_df, index_dir):
     except Exception as e:
         logger.error(f"Error creating keyword index: {e}")
 
+# Create keyword index if documents exist
+if os.path.exists(KEYWORD_INDEX_DIR) and os.path.exists(SEMANTIC_INDEX_DIR):
+    logger.info("Index found, skipping scraping and indexing.")
+else:
+    if not documents_df.empty:
+        create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
+    else:
+        logger.warning("Skipping keyword index creation due to empty document set.")
+
 # --- Step 4: Create Semantic Index with Sentence Transformers ---
 def create_semantic_index(documents_df):
     if documents_df.empty:
@@ -237,6 +227,15 @@ def create_semantic_index(documents_df):
         logger.info("Semantic index created")
     except Exception as e:
         logger.error(f"Error creating semantic index: {e}")
+
+# Create semantic index if documents exist
+if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
+    logger.info("Semantic index found, skipping creation.")
+else:
+    if not documents_df.empty:
+        create_semantic_index(documents_df)
+    else:
+        logger.warning("Skipping semantic index creation due to empty document set.")
 
 # --- Step 5: Search Functions ---
 def keyword_search(query_str, index_dir, limit=5):
