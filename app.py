@@ -38,7 +38,10 @@ os.makedirs(SEMANTIC_INDEX_DIR, exist_ok=True)
 # --- Step 1: Scrape PDF URLs from National Archives ---
 def scrape_pdf_urls():
     try:
-        response = requests.get("https://www.archives.gov/research/rfk", timeout=10)
+        session = requests.Session()
+        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+        response = session.get("https://www.archives.gov/research/rfk", timeout=15)
         if response.status_code != 200:
             logger.error(f"Failed to access National Archives page: Status {response.status_code}")
             return []
@@ -57,7 +60,7 @@ def scrape_pdf_urls():
             href = href.strip()
             if not href:
                 continue
-                
+            
             if href.endswith(".pdf") and "rfk" in href.lower():
                 if href.startswith("https://"):
                     pdf_urls.append(href)
@@ -72,25 +75,28 @@ def scrape_pdf_urls():
         logger.error(f"Error scraping PDF URLs: {e}")
         return []
 
-# Scrape URLs
-PDF_URLS = scrape_pdf_urls()
+# Load or scrape PDF URLs, but skip if indexes exist
+if os.path.exists(KEYWORD_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
+    logger.info("Indexes found, skipping scraping and indexing.")
+    documents_df = pd.read_csv("documents_metadata.csv") if os.path.exists("documents_metadata.csv") else pd.DataFrame()
+else:
+    PDF_URLS = scrape_pdf_urls()
 
-# Fallback: If scraping fails, use a few known URLs from the website content
-if not PDF_URLS:
-    logger.warning("Scraping failed. Using fallback URLs.")
-    PDF_URLS = [
-        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
-        "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
-        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-    ]
+    if not PDF_URLS:
+        logger.warning("Scraping failed. Using fallback URLs.")
+        PDF_URLS = [
+            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
+            "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
+            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
+        ]
 
 # --- Step 2: Stream and Extract Text from PDFs ---
 def stream_and_extract_text(url):
     try:
         session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1)
+        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
         session.mount("https://", HTTPAdapter(max_retries=retries))
-        response = session.get(url, stream=True, timeout=30)
+        response = session.get(url, stream=True, timeout=60)
         if response.status_code != 200:
             logger.error(f"Failed to fetch {url}: Status {response.status_code}")
             return None, []
@@ -98,24 +104,36 @@ def stream_and_extract_text(url):
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             text_chunks = []
             page_count = len(pdf.pages)
+            logger.info(f"Processing PDF {url} with {page_count} pages")
             for i, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                if text.strip():
-                    text_chunks.append({"page": i + 1, "text": text})
-                    logger.info(f"Page {i+1} (text): {text[:50]}...")
-                elif PYTESSERACT_AVAILABLE:
-                    try:
-                        image = page.to_image(resolution=300).original
-                        text = pytesseract.image_to_string(image, lang='eng')
-                        if text.strip():
-                            text_chunks.append({"page": i + 1, "text": text})
-                            logger.info(f"Page {i+1} (OCR): {text[:50]}...")
+                try:
+                    # Try standard text extraction
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        text_chunks.append({"page": i + 1, "text": text})
+                        logger.info(f"Page {i+1} (text): {text[:50]}...")
+                    else:
+                        # If no text extracted, attempt OCR if Tesseract is available
+                        if PYTESSERACT_AVAILABLE:
+                            try:
+                                logger.info(f"Attempting OCR on page {i+1}")
+                                image = page.to_image(resolution=300).original
+                                text = pytesseract.image_to_string(image, lang='eng')
+                                if text.strip():
+                                    text_chunks.append({"page": i + 1, "text": text})
+                                    logger.info(f"Page {i+1} (OCR): {text[:50]}...")
+                                else:
+                                    logger.warning(f"Page {i+1}: No text extracted via OCR, adding empty entry")
+                                    text_chunks.append({"page": i + 1, "text": ""})
+                            except Exception as e:
+                                logger.warning(f"OCR failed on page {i+1}: {e}, adding empty entry")
+                                text_chunks.append({"page": i + 1, "text": ""})
                         else:
-                            logger.warning(f"Page {i+1}: No text extracted via OCR")
-                    except Exception as e:
-                        logger.warning(f"OCR failed on page {i+1}: {e}")
-                else:
-                    logger.warning(f"Page {i+1}: No text extracted (OCR unavailable)")
+                            logger.warning(f"Page {i+1}: No text extracted (OCR unavailable), adding empty entry")
+                            text_chunks.append({"page": i + 1, "text": ""})
+                except Exception as e:
+                    logger.error(f"Error processing page {i+1} of {url}: {e}, adding empty entry")
+                    text_chunks.append({"page": i + 1, "text": ""})
             metadata = {
                 "filename": os.path.basename(url),
                 "page_count": page_count,
@@ -133,9 +151,9 @@ def process_urls(urls):
     for url in urls:
         try:
             session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1)
+            retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
             session.mount("https://", HTTPAdapter(max_retries=retries))
-            response = session.head(url, timeout=5)
+            response = session.head(url, timeout=15)
             if response.status_code != 200:
                 logger.error(f"Invalid URL {url}: Status {response.status_code}")
                 continue
@@ -166,7 +184,7 @@ if PDF_URLS:
     for i in range(0, len(PDF_URLS), BATCH_SIZE):
         batch_urls = PDF_URLS[i:i + BATCH_SIZE]
         logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
-        batch_df = process_urls(batch_urls)  # Now process_urls is defined
+        batch_df = process_urls(batch_urls)
         documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
 else:
     logger.warning("No PDF URLs found to process.")
@@ -274,7 +292,7 @@ def semantic_search(query_str, limit=5):
                 "filename": semantic_index["documents"][i]["filename"],
                 "page": semantic_index["documents"][i]["page"],
                 "url": semantic_index["documents"][i]["url"],
-                "content": ""  # Content not stored in semantic index
+                "content": ""
             }
             for i in top_indices
         ]
@@ -328,9 +346,9 @@ def search():
             {% if results %}
                 {% for result in results %}
                     <p>
-                        <b>File:</b> {{result.filename}} &nbsp;
-                        <b>Page:</b> {{result.page}} &nbsp;
-                        <b>URL:</b> <a href="{{result.url}}" target="_blank">{{result.url}}</a> &nbsp;
+                        <b>File:</b> {{result.filename}}  
+                        <b>Page:</b> {{result.page}}  
+                        <b>URL:</b> <a href="{{result.url}}" target="_blank">{{result.url}}</a>  
                         {% if result.content %}
                             <br><b>Content Preview:</b> {{result.content}}...
                         {% endif %}
