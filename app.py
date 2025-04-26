@@ -38,10 +38,7 @@ os.makedirs(SEMANTIC_INDEX_DIR, exist_ok=True)
 # --- Step 1: Scrape PDF URLs from National Archives ---
 def scrape_pdf_urls():
     try:
-        session = requests.Session()
-        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
-        session.mount("https://", HTTPAdapter(max_retries=retries))
-        response = session.get("https://www.archives.gov/research/rfk", timeout=15)
+        response = requests.get("https://www.archives.gov/research/rfk", timeout=10)
         if response.status_code != 200:
             logger.error(f"Failed to access National Archives page: Status {response.status_code}")
             return []
@@ -60,7 +57,7 @@ def scrape_pdf_urls():
             href = href.strip()
             if not href:
                 continue
-            
+                
             if href.endswith(".pdf") and "rfk" in href.lower():
                 if href.startswith("https://"):
                     pdf_urls.append(href)
@@ -75,28 +72,13 @@ def scrape_pdf_urls():
         logger.error(f"Error scraping PDF URLs: {e}")
         return []
 
-# Load or scrape PDF URLs, but skip if indexes exist
-if os.path.exists(KEYWORD_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
-    logger.info("Indexes found, skipping scraping and indexing.")
-    documents_df = pd.read_csv("documents_metadata.csv") if os.path.exists("documents_metadata.csv") else pd.DataFrame()
-else:
-    PDF_URLS = scrape_pdf_urls()
-
-    if not PDF_URLS:
-        logger.warning("Scraping failed. Using fallback URLs.")
-        PDF_URLS = [
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-        ]
-
 # --- Step 2: Stream and Extract Text from PDFs ---
 def stream_and_extract_text(url):
     try:
         session = requests.Session()
-        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=3, backoff_factor=1)
         session.mount("https://", HTTPAdapter(max_retries=retries))
-        response = session.get(url, stream=True, timeout=60)
+        response = session.get(url, stream=True, timeout=30)
         if response.status_code != 200:
             logger.error(f"Failed to fetch {url}: Status {response.status_code}")
             return None, []
@@ -104,36 +86,24 @@ def stream_and_extract_text(url):
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             text_chunks = []
             page_count = len(pdf.pages)
-            logger.info(f"Processing PDF {url} with {page_count} pages")
             for i, page in enumerate(pdf.pages):
-                try:
-                    # Try standard text extraction
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        text_chunks.append({"page": i + 1, "text": text})
-                        logger.info(f"Page {i+1} (text): {text[:50]}...")
-                    else:
-                        # If no text extracted, attempt OCR if Tesseract is available
-                        if PYTESSERACT_AVAILABLE:
-                            try:
-                                logger.info(f"Attempting OCR on page {i+1}")
-                                image = page.to_image(resolution=300).original
-                                text = pytesseract.image_to_string(image, lang='eng')
-                                if text.strip():
-                                    text_chunks.append({"page": i + 1, "text": text})
-                                    logger.info(f"Page {i+1} (OCR): {text[:50]}...")
-                                else:
-                                    logger.warning(f"Page {i+1}: No text extracted via OCR, adding empty entry")
-                                    text_chunks.append({"page": i + 1, "text": ""})
-                            except Exception as e:
-                                logger.warning(f"OCR failed on page {i+1}: {e}, adding empty entry")
-                                text_chunks.append({"page": i + 1, "text": ""})
+                text = page.extract_text() or ""
+                if text.strip():
+                    text_chunks.append({"page": i + 1, "text": text})
+                    logger.info(f"Page {i+1} (text): {text[:50]}...")
+                elif PYTESSERACT_AVAILABLE:
+                    try:
+                        image = page.to_image(resolution=300).original
+                        text = pytesseract.image_to_string(image, lang='eng')
+                        if text.strip():
+                            text_chunks.append({"page": i + 1, "text": text})
+                            logger.info(f"Page {i+1} (OCR): {text[:50]}...")
                         else:
-                            logger.warning(f"Page {i+1}: No text extracted (OCR unavailable), adding empty entry")
-                            text_chunks.append({"page": i + 1, "text": ""})
-                except Exception as e:
-                    logger.error(f"Error processing page {i+1} of {url}: {e}, adding empty entry")
-                    text_chunks.append({"page": i + 1, "text": ""})
+                            logger.warning(f"Page {i+1}: No text extracted via OCR")
+                    except Exception as e:
+                        logger.warning(f"OCR failed on page {i+1}: {e}")
+                else:
+                    logger.warning(f"Page {i+1}: No text extracted (OCR unavailable)")
             metadata = {
                 "filename": os.path.basename(url),
                 "page_count": page_count,
@@ -145,15 +115,15 @@ def stream_and_extract_text(url):
         logger.error(f"Error processing {url}: {e}")
         return None, []
 
-# --- Ensure process_urls is defined before it's called ---
+# --- Step 3: Process URLs ---
 def process_urls(urls):
     documents = []
     for url in urls:
         try:
             session = requests.Session()
-            retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+            retries = Retry(total=3, backoff_factor=1)
             session.mount("https://", HTTPAdapter(max_retries=retries))
-            response = session.head(url, timeout=15)
+            response = session.head(url, timeout=5)
             if response.status_code != 200:
                 logger.error(f"Invalid URL {url}: Status {response.status_code}")
                 continue
@@ -177,6 +147,19 @@ def process_urls(urls):
     logger.info(f"Processed {len(df)} document chunks from {len(urls)} PDFs")
     return df
 
+# --- Scrape and Process URLs (Moved to Top Level) ---
+# Scrape URLs
+PDF_URLS = scrape_pdf_urls()
+
+# Fallback: If scraping fails, use a few known URLs from the website content
+if not PDF_URLS:
+    logger.warning("Scraping failed. Using fallback URLs.")
+    PDF_URLS = [
+        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
+        "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
+        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
+    ]
+
 # Process PDFs in batches to manage memory
 BATCH_SIZE = 5
 documents_df = pd.DataFrame()
@@ -189,7 +172,7 @@ if PDF_URLS:
 else:
     logger.warning("No PDF URLs found to process.")
 
-# --- Step 3: Create Keyword Index with Whoosh ---
+# --- Step 4: Create Keyword Index with Whoosh ---
 def create_keyword_index(documents_df, index_dir):
     if documents_df.empty:
         logger.warning("No documents to index for keyword search.")
@@ -217,15 +200,15 @@ def create_keyword_index(documents_df, index_dir):
         logger.error(f"Error creating keyword index: {e}")
 
 # Create keyword index if documents exist
-if os.path.exists(KEYWORD_INDEX_DIR) and os.path.exists(SEMANTIC_INDEX_DIR):
-    logger.info("Index found, skipping scraping and indexing.")
+if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
+    logger.info("Keyword index found, skipping creation.")
 else:
     if not documents_df.empty:
         create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
     else:
         logger.warning("Skipping keyword index creation due to empty document set.")
 
-# --- Step 4: Create Semantic Index with Sentence Transformers ---
+# --- Step 5: Create Semantic Index with Sentence Transformers ---
 def create_semantic_index(documents_df):
     if documents_df.empty:
         logger.warning("No documents to index for semantic search.")
@@ -255,7 +238,7 @@ else:
     else:
         logger.warning("Skipping semantic index creation due to empty document set.")
 
-# --- Step 5: Search Functions ---
+# --- Step 6: Search Functions ---
 def keyword_search(query_str, index_dir, limit=5):
     try:
         index = open_dir(index_dir)
@@ -300,7 +283,7 @@ def semantic_search(query_str, limit=5):
         logger.error(f"Semantic search error: {e}")
         return []
 
-# --- Step 6: Flask Web Interface ---
+# --- Step 7: Flask Web Interface ---
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "POST"])
@@ -309,6 +292,7 @@ def search():
     query = ""
     error_message = ""
     status_message = f"Indexed {len(documents_df)} pages from {len(PDF_URLS)} PDFs."
+    
     if request.method == "POST":
         query = request.form.get("query", "").strip()
         if query:
@@ -363,5 +347,6 @@ def search():
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logger.info("Starting Flask app at http://127.0.0.1:5000")
-    app.run(debug=False, host="127.0.0.1", port=5000)
+    logger.info("Starting Flask app")
+    port = int(os.getenv("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
