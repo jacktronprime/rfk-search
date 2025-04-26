@@ -115,16 +115,17 @@ def stream_and_extract_text(url):
                 # Extract text directly
                 text = page.extract_text() or ""
                 if text.strip():
+                    logger.info(f"Page {i+1} extracted text successfully: {text[:50]}...")
                     text_chunks.append({"page": i + 1, "text": text})
-                    logger.info(f"Page {i+1} (text): {text[:50]}...")
                 elif PYTESSERACT_AVAILABLE:
                     try:
-                        # Convert page to image for OCR (reduced resolution to save memory)
-                        image = page.to_image(resolution=150).original
-                        text = pytesseract.image_to_string(image, lang='eng')
+                        # Convert page to image for OCR (increased resolution to improve OCR)
+                        logger.info(f"Attempting OCR on page {i+1}...")
+                        image = page.to_image(resolution=200).original
+                        text = pytesseract.image_to_string(image, lang='eng', config='--psm 6')
                         if text.strip():
+                            logger.info(f"Page {i+1} OCR successful: {text[:50]}...")
                             text_chunks.append({"page": i + 1, "text": text})
-                            logger.info(f"Page {i+1} (OCR): {text[:50]}...")
                         else:
                             logger.warning(f"Page {i+1}: No text extracted via OCR")
                         # Free memory after OCR
@@ -169,6 +170,7 @@ def process_urls(urls):
                 continue
             metadata, chunks = stream_and_extract_text(url)
             if metadata:
+                logger.info(f"Appending {len(chunks)} chunks from {url}")
                 for chunk in chunks:
                     documents.append({
                         "filename": metadata["filename"],
@@ -177,6 +179,8 @@ def process_urls(urls):
                         "page_count": metadata["page_count"],
                         "url": metadata["url"]
                     })
+            else:
+                logger.warning(f"No metadata or chunks returned for {url}")
             log_memory_usage()  # Log memory after processing each URL
         except Exception as e:
             logger.error(f"Error checking {url}: {e}")
@@ -184,6 +188,7 @@ def process_urls(urls):
         logger.warning("No documents processed. Check URLs, network, or text extraction.")
         return pd.DataFrame()
     df = pd.DataFrame(documents)
+    logger.info(f"Created DataFrame with {len(df)} rows: {df.head()}")
     df.to_csv("documents_metadata.csv", index=False)
     logger.info(f"Processed {len(df)} document chunks from {len(urls)} PDFs")
     return df
@@ -251,13 +256,18 @@ def initialize_data():
     global PDF_URLS, documents_df
     logger.info("Starting initialize_data...")
     try:
-        # Temporarily use fallback URLs to minimize resource usage
-        logger.info("Using fallback URLs for debugging...")
-        PDF_URLS = [
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
-            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-        ]
+        # Scrape all PDFs from the National Archives URL
+        logger.info("Scraping PDF URLs...")
+        PDF_URLS = scrape_pdf_urls()
+
+        # Fallback: If scraping fails, use a few known URLs from the website content
+        if not PDF_URLS:
+            logger.warning("Scraping failed. Using fallback URLs.")
+            PDF_URLS = [
+                "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
+                "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
+                "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
+            ]
         logger.info(f"PDF_URLS: {PDF_URLS}")
 
         # Process PDFs in batches to manage memory
@@ -269,6 +279,7 @@ def initialize_data():
                 logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
                 batch_df = process_urls(batch_urls)
                 documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
+                logger.info(f"Updated documents_df with {len(documents_df)} rows after batch {i+1}")
         else:
             logger.warning("No PDF URLs found to process.")
             raise ValueError("No PDF URLs found to process.")
