@@ -37,6 +37,10 @@ SEMANTIC_INDEX_DIR = "/mnt/disk/index/semantic" if os.path.exists("/mnt/disk") e
 os.makedirs(KEYWORD_INDEX_DIR, exist_ok=True)
 os.makedirs(SEMANTIC_INDEX_DIR, exist_ok=True)
 
+# --- Global Variables ---
+PDF_URLS = []
+documents_df = pd.DataFrame()
+
 # --- Step 1: Scrape PDF URLs from National Archives ---
 def scrape_pdf_urls():
     try:
@@ -201,19 +205,26 @@ def create_semantic_index(documents_df):
 
 # --- Step 6: Initialize Indices ---
 def initialize_indices():
-    global documents_df
+    global PDF_URLS, documents_df  # Declare as global to modify
     if exists_in(KEYWORD_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
         logger.info("Existing indices found, loading metadata.")
         metadata_path = "/mnt/disk/documents_metadata.csv" if os.path.exists("/mnt/disk") else "documents_metadata.csv"
         documents_df = pd.read_csv(metadata_path) if os.path.exists(metadata_path) else pd.DataFrame()
+        PDF_URLS.extend(scrape_pdf_urls())  # Repopulate PDF_URLS if loading indices
+        if not PDF_URLS:
+            logger.warning("Scraping failed. Using fallback URLs.")
+            PDF_URLS.extend([
+                "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
+                "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
+            ])
         return
-    PDF_URLS = scrape_pdf_urls()
+    PDF_URLS.extend(scrape_pdf_urls())
     if not PDF_URLS:
         logger.warning("Scraping failed. Using fallback URLs.")
-        PDF_URLS = [
+        PDF_URLS.extend([
             "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
             "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-        ]
+        ])
     BATCH_SIZE = 2
     documents_df = pd.DataFrame()
     for i in range(0, len(PDF_URLS), BATCH_SIZE):
@@ -280,6 +291,7 @@ def handle_error(error):
 
 @app.route("/", methods=["GET", "POST"])
 def search():
+    global PDF_URLS, documents_df  # Access global variables
     results = []
     query = ""
     error_message = ""
