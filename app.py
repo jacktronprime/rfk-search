@@ -15,7 +15,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from PIL import Image
 import pytesseract
+import shutil
+import psutil  # For memory usage logging
 from bs4 import BeautifulSoup
+import gc  # For garbage collection to free memory
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,6 +28,7 @@ logger = logging.getLogger(__name__)
 try:
     PYTESSERACT_AVAILABLE = True
     logger.info(f"Tesseract version: {pytesseract.get_tesseract_version()}")
+    logger.info(f"Tesseract path: {shutil.which('tesseract')}")
 except Exception as e:
     PYTESSERACT_AVAILABLE = False
     logger.warning(f"pytesseract/Tesseract unavailable: {e}. OCR will be skipped.")
@@ -38,6 +42,12 @@ os.makedirs(SEMANTIC_INDEX_DIR, exist_ok=True)
 # Global variables to store processed data
 PDF_URLS = None
 documents_df = pd.DataFrame()
+
+# --- Utility to Log Memory Usage ---
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    logger.info(f"Memory usage: {mem_info.rss / 1024 / 1024:.2f} MB")
 
 # --- Step 1: Scrape PDF URLs from National Archives ---
 def scrape_pdf_urls():
@@ -76,7 +86,7 @@ def scrape_pdf_urls():
         logger.error(f"Error scraping PDF URLs: {e}")
         return []
 
-# --- Step 2: Stream and Extract Text from PDFs ---
+# --- Step 2: Stream and Extract Text from PDFs (Process One Page at a Time) ---
 def stream_and_extract_text(url):
     try:
         session = requests.Session()
@@ -87,34 +97,60 @@ def stream_and_extract_text(url):
             logger.error(f"Failed to fetch {url}: Status {response.status_code}")
             return None, []
         
-        with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-            text_chunks = []
+        # Load the PDF file into memory
+        pdf_data = io.BytesIO(response.content)
+        text_chunks = []
+        page_count = 0
+        
+        # Open the PDF and process one page at a time
+        with pdfplumber.open(pdf_data) as pdf:
             page_count = len(pdf.pages)
-            for i, page in enumerate(pdf.pages):
+            logger.info(f"Processing PDF: {url} with {page_count} pages")
+            
+            for i in range(page_count):
+                # Load only the current page
+                page = pdf.pages[i]
+                logger.info(f"Processing page {i+1} of {page_count}")
+                
+                # Extract text directly
                 text = page.extract_text() or ""
                 if text.strip():
                     text_chunks.append({"page": i + 1, "text": text})
                     logger.info(f"Page {i+1} (text): {text[:50]}...")
                 elif PYTESSERACT_AVAILABLE:
                     try:
-                        image = page.to_image(resolution=300).original
+                        # Convert page to image for OCR (reduced resolution to save memory)
+                        image = page.to_image(resolution=150).original
                         text = pytesseract.image_to_string(image, lang='eng')
                         if text.strip():
                             text_chunks.append({"page": i + 1, "text": text})
                             logger.info(f"Page {i+1} (OCR): {text[:50]}...")
                         else:
                             logger.warning(f"Page {i+1}: No text extracted via OCR")
+                        # Free memory after OCR
+                        del image
+                        gc.collect()
                     except Exception as e:
                         logger.warning(f"OCR failed on page {i+1}: {e}")
                 else:
                     logger.warning(f"Page {i+1}: No text extracted (OCR unavailable)")
-            metadata = {
-                "filename": os.path.basename(url),
-                "page_count": page_count,
-                "url": url
-            }
-            logger.info(f"Processed {url}: {page_count} pages, {len(text_chunks)} with text")
-            return metadata, text_chunks
+                
+                # Free memory after processing each page
+                del page
+                gc.collect()
+                log_memory_usage()  # Log memory after each page
+        
+        # Free memory after processing the PDF
+        del pdf_data
+        gc.collect()
+        
+        metadata = {
+            "filename": os.path.basename(url),
+            "page_count": page_count,
+            "url": url
+        }
+        logger.info(f"Processed {url}: {page_count} pages, {len(text_chunks)} with text")
+        return metadata, text_chunks
     except Exception as e:
         logger.error(f"Error processing {url}: {e}")
         return None, []
@@ -141,6 +177,7 @@ def process_urls(urls):
                         "page_count": metadata["page_count"],
                         "url": metadata["url"]
                     })
+            log_memory_usage()  # Log memory after processing each URL
         except Exception as e:
             logger.error(f"Error checking {url}: {e}")
     if not documents:
@@ -175,8 +212,10 @@ def create_keyword_index(documents_df, index_dir):
             )
         writer.commit()
         logger.info("Keyword index created")
+        log_memory_usage()  # Log memory after keyword indexing
     except Exception as e:
         logger.error(f"Error creating keyword index: {e}")
+        raise
 
 # --- Step 5: Create Semantic Index with Sentence Transformers ---
 def create_semantic_index(documents_df):
@@ -184,6 +223,8 @@ def create_semantic_index(documents_df):
         logger.warning("No documents to index for semantic search.")
         return
     try:
+        # Load model only when needed and free memory afterward
+        logger.info("Loading sentence-transformers model...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
         texts = documents_df["text"].tolist()
         embeddings = model.encode(texts, show_progress_bar=True)
@@ -196,53 +237,66 @@ def create_semantic_index(documents_df):
         with open(index_path, "wb") as f:
             pickle.dump(semantic_index, f)
         logger.info("Semantic index created")
+        log_memory_usage()  # Log memory after semantic indexing
+        # Free memory
+        del model, embeddings, texts, semantic_index
+        gc.collect()
+        log_memory_usage()  # Log memory after freeing
     except Exception as e:
         logger.error(f"Error creating semantic index: {e}")
+        raise
 
 # --- Function to Process PDFs and Create Indexes ---
 def initialize_data():
     global PDF_URLS, documents_df
-    # Scrape URLs
-    PDF_URLS = scrape_pdf_urls()
-
-    # Fallback: If scraping fails, use a few known URLs from the website content
-    if not PDF_URLS:
-        logger.warning("Scraping failed. Using fallback URLs.")
+    logger.info("Starting initialize_data...")
+    try:
+        # Temporarily use fallback URLs to minimize resource usage
+        logger.info("Using fallback URLs for debugging...")
         PDF_URLS = [
             "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
             "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
             "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
         ]
+        logger.info(f"PDF_URLS: {PDF_URLS}")
 
-    # Process PDFs in batches to manage memory
-    BATCH_SIZE = 1  # Reduced to minimize resource usage
-    documents_df = pd.DataFrame()
-    if PDF_URLS:
-        for i in range(0, len(PDF_URLS), BATCH_SIZE):
-            batch_urls = PDF_URLS[i:i + BATCH_SIZE]
-            logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
-            batch_df = process_urls(batch_urls)
-            documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
-    else:
-        logger.warning("No PDF URLs found to process.")
-
-    # Create keyword index if documents exist
-    if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
-        logger.info("Keyword index found, skipping creation.")
-    else:
-        if not documents_df.empty:
-            create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
+        # Process PDFs in batches to manage memory
+        BATCH_SIZE = 1  # Reduced to minimize resource usage
+        documents_df = pd.DataFrame()
+        if PDF_URLS:
+            for i in range(0, len(PDF_URLS), BATCH_SIZE):
+                batch_urls = PDF_URLS[i:i + BATCH_SIZE]
+                logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
+                batch_df = process_urls(batch_urls)
+                documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
         else:
-            logger.warning("Skipping keyword index creation due to empty document set.")
+            logger.warning("No PDF URLs found to process.")
+            raise ValueError("No PDF URLs found to process.")
 
-    # Create semantic index if documents exist
-    if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
-        logger.info("Semantic index found, skipping creation.")
-    else:
-        if not documents_df.empty:
-            create_semantic_index(documents_df)
+        # Create keyword index if documents exist
+        if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
+            logger.info("Keyword index found, skipping creation.")
         else:
-            logger.warning("Skipping semantic index creation due to empty document set.")
+            if not documents_df.empty:
+                logger.info("Creating keyword index...")
+                create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
+            else:
+                logger.warning("Skipping keyword index creation due to empty document set.")
+                raise ValueError("No documents to index for keyword search.")
+
+        # Create semantic index if documents exist
+        if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
+            logger.info("Semantic index found, skipping creation.")
+        else:
+            if not documents_df.empty:
+                logger.info("Creating semantic index...")
+                create_semantic_index(documents_df)
+            else:
+                logger.warning("Skipping semantic index creation due to empty document set.")
+                raise ValueError("No documents to index for semantic search.")
+    except Exception as e:
+        logger.error(f"Error in initialize_data: {str(e)}", exc_info=True)
+        raise
 
 # --- Step 6: Search Functions ---
 def keyword_search(query_str, index_dir, limit=5):
@@ -261,6 +315,8 @@ def keyword_search(query_str, index_dir, limit=5):
 
 def semantic_search(query_str, limit=5):
     try:
+        # Load model only when needed and free memory afterward
+        logger.info("Loading sentence-transformers model for search...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
         index_path = os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")
         if not os.path.exists(index_path):
@@ -276,7 +332,7 @@ def semantic_search(query_str, limit=5):
         )
         top_indices = np.argsort(similarities)[::-1][:limit]
         
-        return [
+        results = [
             {
                 "filename": semantic_index["documents"][i]["filename"],
                 "page": semantic_index["documents"][i]["page"],
@@ -285,6 +341,11 @@ def semantic_search(query_str, limit=5):
             }
             for i in top_indices
         ]
+        # Free memory
+        del model, query_embedding, embeddings, similarities, semantic_index
+        gc.collect()
+        log_memory_usage()  # Log memory after search
+        return results
     except Exception as e:
         logger.error(f"Semantic search error: {e}")
         return []
@@ -299,10 +360,17 @@ def health():
 @app.route("/initialize", methods=["POST"])
 def initialize():
     global PDF_URLS, documents_df
-    if PDF_URLS is None or documents_df.empty:
-        initialize_data()
-        return "Data initialized successfully.", 200
-    return "Data already initialized.", 200
+    try:
+        if PDF_URLS is None or documents_df.empty:
+            logger.info("Starting data initialization...")
+            initialize_data()
+            logger.info("Data initialization completed successfully.")
+            return "Data initialized successfully.", 200
+        logger.info("Data already initialized.")
+        return "Data already initialized.", 200
+    except Exception as e:
+        logger.error(f"Error during initialization: {str(e)}", exc_info=True)
+        return f"Initialization failed: {str(e)}", 500
 
 @app.route("/", methods=["GET", "POST"])
 def search():
