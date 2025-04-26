@@ -19,8 +19,8 @@ COPY . .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose the port Render will use (Render sets the PORT environment variable)
-EXPOSE $PORT
+# Expose port 5000 (Render will map this to an external port)
+EXPOSE 5000
 
-# Define the command to run your app using gunicorn
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:$PORT"]
+# Define the command to run your app using gunicorn with a hardcoded port
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000"]
