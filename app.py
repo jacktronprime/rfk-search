@@ -199,6 +199,51 @@ def create_semantic_index(documents_df):
     except Exception as e:
         logger.error(f"Error creating semantic index: {e}")
 
+# --- Function to Process PDFs and Create Indexes ---
+def initialize_data():
+    global PDF_URLS, documents_df
+    # Scrape URLs
+    PDF_URLS = scrape_pdf_urls()
+
+    # Fallback: If scraping fails, use a few known URLs from the website content
+    if not PDF_URLS:
+        logger.warning("Scraping failed. Using fallback URLs.")
+        PDF_URLS = [
+            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
+            "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
+            "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
+        ]
+
+    # Process PDFs in batches to manage memory
+    BATCH_SIZE = 1  # Reduced to minimize resource usage
+    documents_df = pd.DataFrame()
+    if PDF_URLS:
+        for i in range(0, len(PDF_URLS), BATCH_SIZE):
+            batch_urls = PDF_URLS[i:i + BATCH_SIZE]
+            logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
+            batch_df = process_urls(batch_urls)
+            documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
+    else:
+        logger.warning("No PDF URLs found to process.")
+
+    # Create keyword index if documents exist
+    if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
+        logger.info("Keyword index found, skipping creation.")
+    else:
+        if not documents_df.empty:
+            create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
+        else:
+            logger.warning("Skipping keyword index creation due to empty document set.")
+
+    # Create semantic index if documents exist
+    if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
+        logger.info("Semantic index found, skipping creation.")
+    else:
+        if not documents_df.empty:
+            create_semantic_index(documents_df)
+        else:
+            logger.warning("Skipping semantic index creation due to empty document set.")
+
 # --- Step 6: Search Functions ---
 def keyword_search(query_str, index_dir, limit=5):
     try:
@@ -244,48 +289,20 @@ def semantic_search(query_str, limit=5):
         logger.error(f"Semantic search error: {e}")
         return []
 
-# --- Function to Process PDFs and Create Indexes (Run After Flask Starts) ---
-def initialize_data():
-    global PDF_URLS, documents_df
-    # Scrape URLs
-    PDF_URLS = [
-        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-1-of-2.pdf",
-        "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
-        "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
-    ]
-
-    # Process PDFs in batches to manage memory
-    BATCH_SIZE = 5
-    documents_df = pd.DataFrame()
-    if PDF_URLS:
-        for i in range(0, len(PDF_URLS), BATCH_SIZE):
-            batch_urls = PDF_URLS[i:i + BATCH_SIZE]
-            logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
-            batch_df = process_urls(batch_urls)
-            documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
-    else:
-        logger.warning("No PDF URLs found to process.")
-
-    # Create keyword index if documents exist
-    if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
-        logger.info("Keyword index found, skipping creation.")
-    else:
-        if not documents_df.empty:
-            create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
-        else:
-            logger.warning("Skipping keyword index creation due to empty document set.")
-
-    # Create semantic index if documents exist
-    if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
-        logger.info("Semantic index found, skipping creation.")
-    else:
-        if not documents_df.empty:
-            create_semantic_index(documents_df)
-        else:
-            logger.warning("Skipping semantic index creation due to empty document set.")
-
 # --- Step 7: Flask Web Interface ---
 app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/initialize", methods=["POST"])
+def initialize():
+    global PDF_URLS, documents_df
+    if PDF_URLS is None or documents_df.empty:
+        initialize_data()
+        return "Data initialized successfully.", 200
+    return "Data already initialized.", 200
 
 @app.route("/", methods=["GET", "POST"])
 def search():
@@ -325,6 +342,9 @@ def search():
                 <input type="text" name="query" value="{{query}}" placeholder="Enter search query (e.g., Sirhan Sirhan)">
                 <input type="submit" value="Search">
             </form>
+            <form method="POST" action="/initialize">
+                <input type="submit" value="Initialize Data">
+            </form>
             {% if error_message %}
                 <p class="error">{{error_message}}</p>
             {% endif %}
@@ -350,6 +370,4 @@ def search():
 # --- Main Execution ---
 if __name__ == "__main__":
     logger.info("Starting Flask app")
-    # Delay PDF processing until after Flask starts
-    initialize_data()
     app.run(debug=False, host="0.0.0.0", port=5000)
