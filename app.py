@@ -16,15 +16,15 @@ from urllib3.util.retry import Retry
 from PIL import Image
 import pytesseract
 import shutil
-import psutil  # For memory usage logging
+import psutil  # For disk and memory usage logging
 from bs4 import BeautifulSoup
-import gc  # For garbage collection to free memory
+import gc  # For garbage collection
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Verify pytesseract and Tesseract
+# --- Verify pytesseract and Tesseract ---
 try:
     PYTESSERACT_AVAILABLE = True
     logger.info(f"Tesseract version: {pytesseract.get_tesseract_version()}")
@@ -33,21 +33,42 @@ except Exception as e:
     PYTESSERACT_AVAILABLE = False
     logger.warning(f"pytesseract/Tesseract unavailable: {e}. OCR will be skipped.")
 
-# --- Setup Directories (only for indexes) ---
-KEYWORD_INDEX_DIR = "index/keyword"
-SEMANTIC_INDEX_DIR = "index/semantic"
+# --- Setup Persistent Disk Directories ---
+KEYWORD_INDEX_DIR = "/opt/render/project/disk/index/keyword"
+SEMANTIC_INDEX_DIR = "/opt/render/project/disk/index/semantic"
+TEMP_DIR = "/opt/render/project/disk/tmp"
+TESSDATA_DIR = "/opt/render/project/disk/tessdata"
+METADATA_PATH = "/opt/render/project/disk/documents_metadata.csv"
+
 os.makedirs(KEYWORD_INDEX_DIR, exist_ok=True)
 os.makedirs(SEMANTIC_INDEX_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(TESSDATA_DIR, exist_ok=True)
+os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
 
-# Global variables to store processed data
+# Global variables
 PDF_URLS = None
 documents_df = pd.DataFrame()
 
-# --- Utility to Log Memory Usage ---
-def log_memory_usage():
+# --- Utility to Log Memory and Disk Usage ---
+def log_resource_usage():
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     logger.info(f"Memory usage: {mem_info.rss / 1024 / 1024:.2f} MB")
+    try:
+        disk_usage = psutil.disk_usage("/opt/render/project/disk")
+        logger.info(f"Disk usage: {disk_usage.used / 1024 / 1024:.2f} MB / {disk_usage.total / 1024 / 1024:.2f} MB")
+    except Exception as e:
+        logger.error(f"Disk usage check failed: {e}")
+
+# --- Clean Up Temporary Files ---
+def cleanup_temp_files():
+    try:
+        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        logger.info("Cleaned up temporary files")
+    except Exception as e:
+        logger.error(f"Failed to clean up temporary files: {e}")
 
 # --- Step 1: Scrape PDF URLs from National Archives ---
 def scrape_pdf_urls():
@@ -59,26 +80,23 @@ def scrape_pdf_urls():
         
         soup = BeautifulSoup(response.text, "html.parser")
         links = soup.find_all("a")
-        logger.info(f"Found {len(links)} total links on the page")
+        logger.info(f"Found {len(links)} total links")
         
         pdf_urls = []
         for link in links:
             href = link.get("href")
             if not href:
-                logger.debug("Link without href attribute encountered")
                 continue
-            
             href = href.strip()
-            if not href:
-                continue
-                
             if href.endswith(".pdf") and "rfk" in href.lower():
                 if href.startswith("https://"):
                     pdf_urls.append(href)
                 else:
                     pdf_urls.append(f"https://www.archives.gov{href}")
         
-        logger.info(f"Found {len(pdf_urls)} PDF URLs")
+        # Filter to relevant PDFs to reduce storage
+        pdf_urls = [url for url in pdf_urls if "sirhan" in url.lower() or "fbi" in url.lower()]
+        logger.info(f"Filtered to {len(pdf_urls)} relevant PDF URLs")
         if pdf_urls:
             logger.debug(f"Sample URLs: {pdf_urls[:3]}")
         return pdf_urls
@@ -86,7 +104,7 @@ def scrape_pdf_urls():
         logger.error(f"Error scraping PDF URLs: {e}")
         return []
 
-# --- Step 2: Stream and Extract Text from PDFs (Process One Page at a Time) ---
+# --- Step 2: Stream and Extract Text from PDFs ---
 def stream_and_extract_text(url):
     try:
         session = requests.Session()
@@ -97,29 +115,24 @@ def stream_and_extract_text(url):
             logger.error(f"Failed to fetch {url}: Status {response.status_code}")
             return None, []
         
-        # Load the PDF file into memory
         pdf_data = io.BytesIO(response.content)
         text_chunks = []
         page_count = 0
         
-        # Open the PDF and process one page at a time
         with pdfplumber.open(pdf_data) as pdf:
             page_count = len(pdf.pages)
             logger.info(f"Processing PDF: {url} with {page_count} pages")
             
             for i in range(page_count):
-                # Load only the current page
                 page = pdf.pages[i]
                 logger.info(f"Processing page {i+1} of {page_count}")
                 
-                # Extract text directly
                 text = page.extract_text() or ""
                 if text.strip():
-                    logger.info(f"Page {i+1} extracted text successfully: {text[:50]}...")
+                    logger.info(f"Page {i+1} extracted text: {text[:50]}...")
                     text_chunks.append({"page": i + 1, "text": text})
                 elif PYTESSERACT_AVAILABLE:
                     try:
-                        # Convert page to image for OCR (increased resolution to improve OCR)
                         logger.info(f"Attempting OCR on page {i+1}...")
                         image = page.to_image(resolution=200).original
                         text = pytesseract.image_to_string(image, lang='eng', config='--psm 6')
@@ -128,7 +141,6 @@ def stream_and_extract_text(url):
                             text_chunks.append({"page": i + 1, "text": text})
                         else:
                             logger.warning(f"Page {i+1}: No text extracted via OCR")
-                        # Free memory after OCR
                         del image
                         gc.collect()
                     except Exception as e:
@@ -136,12 +148,11 @@ def stream_and_extract_text(url):
                 else:
                     logger.warning(f"Page {i+1}: No text extracted (OCR unavailable)")
                 
-                # Free memory after processing each page
                 del page
                 gc.collect()
-                log_memory_usage()  # Log memory after each page
+                cleanup_temp_files()  # Clean up after each page
+                log_resource_usage()
         
-        # Free memory after processing the PDF
         del pdf_data
         gc.collect()
         
@@ -171,32 +182,33 @@ def process_urls(urls):
             metadata, chunks = stream_and_extract_text(url)
             if metadata:
                 logger.info(f"Appending {len(chunks)} chunks from {url}")
-                for chunk in chunks:
-                    documents.append({
-                        "filename": metadata["filename"],
-                        "page": chunk["page"],
-                        "text": chunk["text"],
-                        "page_count": metadata["page_count"],
-                        "url": metadata["url"]
-                    })
+                batch_df = pd.DataFrame([{
+                    "filename": metadata["filename"],
+                    "page": chunk["page"],
+                    "text": chunk["text"],
+                    "page_count": metadata["page_count"],
+                    "url": metadata["url"]
+                } for chunk in chunks])
+                batch_df.to_csv(f"/opt/render/project/disk/batch_{url.split('/')[-1]}.csv", index=False)
+                documents.extend(batch_df.to_dict("records"))
             else:
-                logger.warning(f"No metadata or chunks returned for {url}")
-            log_memory_usage()  # Log memory after processing each URL
+                logger.warning(f"No metadata or chunks for {url}")
+            log_resource_usage()
         except Exception as e:
             logger.error(f"Error checking {url}: {e}")
     if not documents:
-        logger.warning("No documents processed. Check URLs, network, or text extraction.")
+        logger.warning("No documents processed")
         return pd.DataFrame()
     df = pd.DataFrame(documents)
-    logger.info(f"Created DataFrame with {len(df)} rows: {df.head()}")
-    df.to_csv("documents_metadata.csv", index=False)
-    logger.info(f"Processed {len(df)} document chunks from {len(urls)} PDFs")
+    logger.info(f"Created DataFrame with {len(df)} rows")
+    df.to_csv(METADATA_PATH, index=False)
+    logger.info(f"Saved metadata to {METADATA_PATH}")
     return df
 
 # --- Step 4: Create Keyword Index with Whoosh ---
 def create_keyword_index(documents_df, index_dir):
     if documents_df.empty:
-        logger.warning("No documents to index for keyword search.")
+        logger.warning("No documents to index for keyword search")
         return
     try:
         schema = Schema(
@@ -206,8 +218,7 @@ def create_keyword_index(documents_df, index_dir):
             content=TEXT(stored=True)
         )
         index = create_in(index_dir, schema)
-        writer = index.writer()
-        
+        writer = index.writer(limitmb=512)  # Cap index size
         for _, row in documents_df.iterrows():
             writer.add_document(
                 filename=row["filename"],
@@ -217,7 +228,7 @@ def create_keyword_index(documents_df, index_dir):
             )
         writer.commit()
         logger.info("Keyword index created")
-        log_memory_usage()  # Log memory after keyword indexing
+        log_resource_usage()
     except Exception as e:
         logger.error(f"Error creating keyword index: {e}")
         raise
@@ -225,10 +236,9 @@ def create_keyword_index(documents_df, index_dir):
 # --- Step 5: Create Semantic Index with Sentence Transformers ---
 def create_semantic_index(documents_df):
     if documents_df.empty:
-        logger.warning("No documents to index for semantic search.")
+        logger.warning("No documents to index for semantic search")
         return
     try:
-        # Load model only when needed and free memory afterward
         logger.info("Loading sentence-transformers model...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
         texts = documents_df["text"].tolist()
@@ -241,26 +251,24 @@ def create_semantic_index(documents_df):
         index_path = os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")
         with open(index_path, "wb") as f:
             pickle.dump(semantic_index, f)
-        logger.info("Semantic index created")
-        log_memory_usage()  # Log memory after semantic indexing
-        # Free memory
+        logger.info(f"Semantic index saved to {index_path}")
+        log_resource_usage()
         del model, embeddings, texts, semantic_index
         gc.collect()
-        log_memory_usage()  # Log memory after freeing
+        log_resource_usage()
     except Exception as e:
         logger.error(f"Error creating semantic index: {e}")
         raise
 
-# --- Function to Process PDFs and Create Indexes ---
+# --- Initialize Data ---
 def initialize_data():
     global PDF_URLS, documents_df
     logger.info("Starting initialize_data...")
     try:
-        # Scrape all PDFs from the National Archives URL
+        # Scrape PDFs
         logger.info("Scraping PDF URLs...")
         PDF_URLS = scrape_pdf_urls()
-
-        # Fallback: If scraping fails, use a few known URLs from the website content
+        
         if not PDF_URLS:
             logger.warning("Scraping failed. Using fallback URLs.")
             PDF_URLS = [
@@ -268,43 +276,37 @@ def initialize_data():
                 "https://www.archives.gov/files/research/jfk/rfk/166-12c-1-serial-1-56-la-156-la-report-6-15-68-part-1-of-7.pdf",
                 "https://www.archives.gov/files/research/jfk/rfk/44-bh-1772-part-2-of-2.pdf",
             ]
-        logger.info(f"PDF_URLS: {PDF_URLS}")
-
-        # Process PDFs in batches to manage memory
-        BATCH_SIZE = 1  # Reduced to minimize resource usage
+        logger.info(f"PDF_URLS: {len(PDF_URLS)}")
+        
+        # Process PDFs in batches
+        BATCH_SIZE = 1
         documents_df = pd.DataFrame()
-        if PDF_URLS:
-            for i in range(0, len(PDF_URLS), BATCH_SIZE):
-                batch_urls = PDF_URLS[i:i + BATCH_SIZE]
-                logger.info(f"Processing batch {i//BATCH_SIZE + 1} of {len(PDF_URLS)//BATCH_SIZE + 1}")
-                batch_df = process_urls(batch_urls)
-                documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
-                logger.info(f"Updated documents_df with {len(documents_df)} rows after batch {i+1}")
-        else:
-            logger.warning("No PDF URLs found to process.")
-            raise ValueError("No PDF URLs found to process.")
-
-        # Create keyword index if documents exist
+        for i in range(0, len(PDF_URLS), BATCH_SIZE):
+            batch_urls = PDF_URLS[i:i + BATCH_SIZE]
+            logger.info(f"Processing batch {i//BATCH_SIZE + 1}")
+            batch_df = process_urls(batch_urls)
+            documents_df = pd.concat([documents_df, batch_df], ignore_index=True)
+            logger.info(f"Updated documents_df with {len(documents_df)} rows")
+            log_resource_usage()
+        
+        if documents_df.empty:
+            logger.warning("No documents processed")
+            raise ValueError("No documents to index")
+        
+        # Create indexes
         if os.path.exists(KEYWORD_INDEX_DIR) and os.listdir(KEYWORD_INDEX_DIR):
-            logger.info("Keyword index found, skipping creation.")
+            logger.info("Keyword index found, skipping creation")
         else:
-            if not documents_df.empty:
-                logger.info("Creating keyword index...")
-                create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
-            else:
-                logger.warning("Skipping keyword index creation due to empty document set.")
-                raise ValueError("No documents to index for keyword search.")
-
-        # Create semantic index if documents exist
+            logger.info("Creating keyword index...")
+            create_keyword_index(documents_df, KEYWORD_INDEX_DIR)
+        
         if os.path.exists(SEMANTIC_INDEX_DIR) and os.path.exists(os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")):
-            logger.info("Semantic index found, skipping creation.")
+            logger.info("Semantic index found, skipping creation")
         else:
-            if not documents_df.empty:
-                logger.info("Creating semantic index...")
-                create_semantic_index(documents_df)
-            else:
-                logger.warning("Skipping semantic index creation due to empty document set.")
-                raise ValueError("No documents to index for semantic search.")
+            logger.info("Creating semantic index...")
+            create_semantic_index(documents_df)
+        
+        logger.info("Initialization complete")
     except Exception as e:
         logger.error(f"Error in initialize_data: {str(e)}", exc_info=True)
         raise
@@ -326,12 +328,11 @@ def keyword_search(query_str, index_dir, limit=5):
 
 def semantic_search(query_str, limit=5):
     try:
-        # Load model only when needed and free memory afterward
         logger.info("Loading sentence-transformers model for search...")
         model = SentenceTransformer("all-MiniLM-L6-v2")
         index_path = os.path.join(SEMANTIC_INDEX_DIR, "index.pkl")
         if not os.path.exists(index_path):
-            logger.warning("Semantic index file not found.")
+            logger.warning("Semantic index file not found")
             return []
         with open(index_path, "rb") as f:
             semantic_index = pickle.load(f)
@@ -352,10 +353,9 @@ def semantic_search(query_str, limit=5):
             }
             for i in top_indices
         ]
-        # Free memory
         del model, query_embedding, embeddings, similarities, semantic_index
         gc.collect()
-        log_memory_usage()  # Log memory after search
+        log_resource_usage()
         return results
     except Exception as e:
         logger.error(f"Semantic search error: {e}")
@@ -375,9 +375,9 @@ def initialize():
         if PDF_URLS is None or documents_df.empty:
             logger.info("Starting data initialization...")
             initialize_data()
-            logger.info("Data initialization completed successfully.")
+            logger.info("Data initialization completed")
             return "Data initialized successfully.", 200
-        logger.info("Data already initialized.")
+        logger.info("Data already initialized")
         return "Data already initialized.", 200
     except Exception as e:
         logger.error(f"Error during initialization: {str(e)}", exc_info=True)
@@ -449,4 +449,5 @@ def search():
 # --- Main Execution ---
 if __name__ == "__main__":
     logger.info("Starting Flask app")
+    log_resource_usage()
     app.run(debug=False, host="0.0.0.0", port=5000)
