@@ -4,6 +4,10 @@ FROM python:3.11-slim
 # Install Tesseract and other system dependencies
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
+    libjpeg-dev \
+    zlib1g-dev \
+    libpng-dev \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*  # Clean up to reduce image size
 
 # Set the working directory in the container
